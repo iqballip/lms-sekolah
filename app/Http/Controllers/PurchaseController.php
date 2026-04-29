@@ -17,16 +17,17 @@ class PurchaseController extends Controller
     {
         return view('purchase.index', [
             'title' => 'Purchase',
-            'datas' => Purchase::with('distributor')->paginate(10)
+            // ✅ Fix: eager load details.product supaya tabel index terisi
+            'datas' => Purchase::with(['distributor', 'details.product'])->paginate(10)
         ]);
     }
 
     public function create()
     {
         return view('purchase.create', [
-            'title' => 'Purchase',
+            'title'        => 'Purchase',
             'distributors' => Distributor::all(),
-            'products' => Products::all()
+            'products'     => Products::all()
         ]);
     }
 
@@ -34,47 +35,54 @@ class PurchaseController extends Controller
     {
         try {
             $data = $request->only(['no_nota', 'tgl_nota', 'id_distributor']);
-            $data['total_bayar'] = preg_replace('/[^0-9]/', '', $request->total_bayar);
+            $data['total_bayar'] = 0; // ✅ Fix: dihitung otomatis dari detail
 
             $purchase = Purchase::create($data);
 
-            // handle purchase details if provided
-            $total = 0;
-            $id_barangs = $request->input('id_barang', []);
-            $harga_belis = $request->input('harga_beli', []);
+            $total        = 0;
+            $id_barangs   = $request->input('id_barang', []);
+            $harga_belis  = $request->input('harga_beli', []);
             $margin_juals = $request->input('margin_jual', []);
             $jumlah_belis = $request->input('jumlah_beli', []);
 
             foreach ($id_barangs as $i => $id_barang) {
                 if (empty($id_barang)) continue;
-                $harga = isset($harga_belis[$i]) ? intval(preg_replace('/[^0-9]/', '', $harga_belis[$i])) : 0;
+
+                // ✅ Fix: strip format rupiah dengan benar
+                $harga  = isset($harga_belis[$i])  ? intval(preg_replace('/[^0-9]/', '', $harga_belis[$i]))  : 0;
                 $margin = isset($margin_juals[$i]) ? intval(preg_replace('/[^0-9]/', '', $margin_juals[$i])) : 0;
                 $jumlah = isset($jumlah_belis[$i]) ? intval(preg_replace('/[^0-9]/', '', $jumlah_belis[$i])) : 0;
-                $subtotal = $harga * $jumlah;
+
+                // ✅ Fix: subtotal ikut margin
+                $subtotal = ($harga + $margin) * $jumlah;
 
                 Purchase_Detail::create([
                     'id_pembelian' => $purchase->id,
-                    'id_barang' => $id_barang,
-                    'harga_beli' => $harga,
-                    'margin_jual' => $margin,
-                    'jumlah_beli' => $jumlah,
-                    'subtotal' => $subtotal
+                    'id_barang'    => $id_barang,
+                    'harga_beli'   => $harga,
+                    'margin_jual'  => $margin,
+                    'jumlah_beli'  => $jumlah,
+                    'subtotal'     => $subtotal
                 ]);
+
+                // ✅ Fix: update stok & harga jual produk otomatis
+                $product = Products::find($id_barang);
+                if ($product) {
+                    $product->stok       += $jumlah;
+                    $product->harga_jual  = $harga + $margin;
+                    $product->save();
+                }
 
                 $total += $subtotal;
             }
 
-            // update total bayar if details exist, otherwise use provided field
-            if ($total > 0) {
-                $purchase->total_bayar = $total;
-                $purchase->save();
-            } else {
-                // sanitize provided total_bayar (already set above but ensure formatting)
-                $purchase->total_bayar = $data['total_bayar'] ?? 0;
-                $purchase->save();
-            }
+            // ✅ Fix: simpan total dari hasil hitung detail
+            $purchase->total_bayar = $total;
+            $purchase->save();
 
-            return redirect()->route('purchase.index')->with('simpan', 'Pembelian dengan nota ' . $request->no_nota . ' berhasil disimpan');
+            return redirect()->route('purchase.index')
+                ->with('simpan', 'Pembelian dengan nota ' . $request->no_nota . ' berhasil disimpan');
+
         } catch (QueryException $e) {
             if ($e->errorInfo[1] == 1062) {
                 return redirect()->back()->withInput()->with('error', 'Gagal: No Nota sudah ada.');
@@ -89,9 +97,10 @@ class PurchaseController extends Controller
     {
         try {
             return view('purchase.edit', [
-                'title' => 'Purchase',
-                'data' => Purchase::findOrFail($id),
-                'distributors' => Distributor::all()
+                'title'        => 'Purchase',
+                'data'         => Purchase::with('details')->findOrFail($id),
+                'distributors' => Distributor::all(),
+                'products'     => Products::all(), // ✅ tambah ini
             ]);
         } catch (ModelNotFoundException $e) {
             return redirect()->route('purchase.index')->with('error', 'Data pembelian tidak ditemukan.');
@@ -103,14 +112,17 @@ class PurchaseController extends Controller
     public function update(Request $request, string $id)
     {
         try {
-           $data = $request->only(['no_nota', 'tgl_nota', 'id_distributor']);
-           $data['total_bayar'] = preg_replace('/[^0-9]/', '', $request->total_bayar);
+            $data = $request->only(['no_nota', 'tgl_nota', 'id_distributor']);
+            $data['total_bayar'] = intval(preg_replace('/[^0-9]/', '', $request->total_bayar));
 
             $purchase = Purchase::findOrFail($id);
             $purchase->update($data);
-            return redirect()->route('purchase.index')->with('ubah', 'Pembelian dengan nota ' . $request->no_nota . ' berhasil diupdate');
+
+            return redirect()->route('purchase.index')
+                ->with('ubah', 'Pembelian dengan nota ' . $request->no_nota . ' berhasil diupdate');
+
         } catch (QueryException $e) {
-             if ($e->errorInfo[1] == 1062) {
+            if ($e->errorInfo[1] == 1062) {
                 return redirect()->back()->withInput()->with('error', 'Gagal: No Nota sudah ada.');
             }
             return redirect()->back()->withInput()->with('error', 'Gagal mengupdate pembelian: ' . $e->getMessage());
@@ -127,7 +139,10 @@ class PurchaseController extends Controller
             $purchase = Purchase::findOrFail($id);
             $nota = $purchase->no_nota;
             $purchase->delete();
-            return redirect()->route('purchase.index')->with('hapus', 'Pembelian dengan nota ' . $nota . ' berhasil dihapus');
+
+            return redirect()->route('purchase.index')
+                ->with('hapus', 'Pembelian dengan nota ' . $nota . ' berhasil dihapus');
+
         } catch (ModelNotFoundException $e) {
             return redirect()->route('purchase.index')->with('error', 'Data pembelian tidak ditemukan atau sudah dihapus.');
         } catch (QueryException $e) {
